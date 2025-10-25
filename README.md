@@ -245,7 +245,7 @@ If this toolkit prevented a breach at your organization, consider:
 * ⭐ Starring the repository
 * 🐛 Reporting bugs or suggesting features
 * 💬 Sharing with other security professionals
-* ☕ [Buying me a coffee](https://buymeacoffee.com/[you]) (optional)
+* ☕ [Buying me a coffee](https://buymeacoffee.com/scrizo) (optional)
 
 ---
 
