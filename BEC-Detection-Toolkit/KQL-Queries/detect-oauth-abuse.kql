@@ -1,0 +1,253 @@
+// ============================================================================
+// Detect Suspicious OAuth Application Grants
+// ============================================================================
+// Description: Identifies potentially malicious OAuth apps that have been
+//              granted dangerous permissions. Common in BEC attacks where
+//              attackers use compromised accounts to grant malicious apps
+//              access to mailboxes and data.
+//
+// Data Source: AuditLogs (Azure AD/Entra)
+// Author: Don Cook
+// Version: 1.0
+// Last Updated: October 24, 2025
+// ============================================================================
+
+// ============================================================================
+// Query 1: Recently Approved OAuth Applications
+// ============================================================================
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName == "Consent to application"
+| extend 
+    AppName = tostring(TargetResources[0].displayName),
+    AppId = tostring(TargetResources[0].id),
+    ConsentedBy = tostring(InitiatedBy.user.userPrincipalName),
+    ConsentType = tostring(TargetResources[0].modifiedProperties[0].newValue),
+    Permissions = tostring(TargetResources[0].modifiedProperties[1].newValue)
+| project 
+    TimeGenerated,
+    ConsentedBy,
+    AppName,
+    AppId,
+    ConsentType,
+    Permissions,
+    IPAddress = tostring(InitiatedBy.user.ipAddress)
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Query 2: Dangerous Permission Combinations
+// ============================================================================
+// Detects apps with permissions commonly abused in BEC attacks
+AuditLogs
+| where TimeGenerated > ago(90d)
+| where OperationName == "Consent to application"
+| extend 
+    AppName = tostring(TargetResources[0].displayName),
+    Permissions = tostring(TargetResources[0].modifiedProperties[1].newValue),
+    ConsentedBy = tostring(InitiatedBy.user.userPrincipalName)
+| where 
+    Permissions contains "Mail.ReadWrite" or
+    Permissions contains "Mail.Send" or
+    Permissions contains "MailboxSettings.ReadWrite" or
+    Permissions contains "Files.ReadWrite.All" or
+    Permissions contains "Contacts.ReadWrite" or
+    Permissions contains "Directory.ReadWrite.All"
+| project 
+    TimeGenerated,
+    ConsentedBy,
+    AppName,
+    DangerousPermissions = Permissions,
+    RiskLevel = case(
+        Permissions contains "Directory.ReadWrite.All", "CRITICAL",
+        Permissions contains "Mail.Send" and Permissions contains "Mail.ReadWrite", "HIGH",
+        Permissions contains "Mail.ReadWrite", "HIGH",
+        "MEDIUM"
+    )
+| sort by RiskLevel desc, TimeGenerated desc
+
+// ============================================================================
+// Query 3: OAuth Apps Approved During Compromise Window
+// ============================================================================
+// Cross-reference OAuth approvals with risky sign-ins
+let riskyUsers = SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where RiskLevelDuringSignIn in ("high", "medium")
+    | distinct UserPrincipalName;
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName == "Consent to application"
+| extend ConsentedBy = tostring(InitiatedBy.user.userPrincipalName)
+| where ConsentedBy in (riskyUsers)
+| extend 
+    AppName = tostring(TargetResources[0].displayName),
+    Permissions = tostring(TargetResources[0].modifiedProperties[1].newValue)
+| project 
+    TimeGenerated,
+    ConsentedBy,
+    AppName,
+    Permissions,
+    Alert = "⚠️ OAuth approved by user with risky sign-in"
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Query 4: Bulk OAuth Approvals (Automated Attack)
+// ============================================================================
+// Detects when multiple apps are approved in short timeframe
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName == "Consent to application"
+| extend ConsentedBy = tostring(InitiatedBy.user.userPrincipalName)
+| summarize 
+    AppCount = count(),
+    Apps = make_set(tostring(TargetResources[0].displayName)),
+    FirstConsent = min(TimeGenerated),
+    LastConsent = max(TimeGenerated)
+    by ConsentedBy
+| where AppCount >= 3
+| extend TimeSpanMinutes = datetime_diff('minute', LastConsent, FirstConsent)
+| where TimeSpanMinutes <= 60 // Multiple apps in 1 hour
+| project 
+    ConsentedBy,
+    AppCount,
+    TimeSpanMinutes,
+    Apps = tostring(Apps),
+    Alert = "🚨 Multiple OAuth apps approved rapidly"
+| sort by AppCount desc
+
+// ============================================================================
+// Query 5: Unknown/Suspicious Publisher Apps
+// ============================================================================
+// Detects apps from unverified or suspicious publishers
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName == "Consent to application"
+| extend 
+    AppName = tostring(TargetResources[0].displayName),
+    Publisher = tostring(TargetResources[0].modifiedProperties[2].newValue),
+    ConsentedBy = tostring(InitiatedBy.user.userPrincipalName)
+| where 
+    Publisher !contains "Microsoft" and
+    Publisher !contains "Verified" and
+    isnotempty(Publisher)
+| project 
+    TimeGenerated,
+    ConsentedBy,
+    AppName,
+    Publisher,
+    Alert = "⚠️ Unverified publisher"
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Query 6: Admin Consent Grants (High Risk)
+// ============================================================================
+// Monitors when admin consent is granted (affects all users)
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName in ("Add app role assignment to service principal", "Consent to application")
+| extend 
+    ConsentType = tostring(TargetResources[0].modifiedProperties[0].newValue),
+    AppName = tostring(TargetResources[0].displayName),
+    GrantedBy = tostring(InitiatedBy.user.userPrincipalName),
+    Permissions = tostring(TargetResources[0].modifiedProperties[1].newValue)
+| where ConsentType contains "Admin" or ConsentType contains "AllPrincipals"
+| project 
+    TimeGenerated,
+    GrantedBy,
+    AppName,
+    ConsentType,
+    Permissions,
+    RiskLevel = "CRITICAL",
+    Alert = "🔴 Admin consent granted - affects all users"
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Query 7: OAuth Apps with Mailbox Access - Historical Baseline
+// ============================================================================
+// Compares recent OAuth approvals against historical patterns
+let historicalApps = AuditLogs
+    | where TimeGenerated between (ago(90d) .. ago(30d))
+    | where OperationName == "Consent to application"
+    | extend AppName = tostring(TargetResources[0].displayName)
+    | summarize by AppName;
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName == "Consent to application"
+| extend 
+    AppName = tostring(TargetResources[0].displayName),
+    ConsentedBy = tostring(InitiatedBy.user.userPrincipalName),
+    Permissions = tostring(TargetResources[0].modifiedProperties[1].newValue)
+| where AppName !in (historicalApps) // New app, never seen before
+| where Permissions contains "Mail"
+| project 
+    TimeGenerated,
+    ConsentedBy,
+    AppName,
+    Permissions,
+    Alert = "🆕 First time this app has been approved"
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Query 8: Revoked Then Re-Approved Apps
+// ============================================================================
+// Detects when apps are revoked and then re-approved (persistence attempt)
+let revokedApps = AuditLogs
+    | where TimeGenerated > ago(30d)
+    | where OperationName == "Remove app role assignment from service principal"
+    | extend AppName = tostring(TargetResources[0].displayName)
+    | project RevokedTime = TimeGenerated, AppName;
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName == "Consent to application"
+| extend AppName = tostring(TargetResources[0].displayName)
+| join kind=inner (revokedApps) on AppName
+| where TimeGenerated > RevokedTime
+| project 
+    AppName,
+    RevokedTime,
+    ReapprovedTime = TimeGenerated,
+    ConsentedBy = tostring(InitiatedBy.user.userPrincipalName),
+    Alert = "⚠️ App was revoked and then re-approved"
+| sort by ReapprovedTime desc
+
+// ============================================================================
+// Consolidated OAuth Risk Dashboard
+// ============================================================================
+AuditLogs
+| where TimeGenerated > ago(30d)
+| where OperationName == "Consent to application"
+| extend 
+    AppName = tostring(TargetResources[0].displayName),
+    Permissions = tostring(TargetResources[0].modifiedProperties[1].newValue),
+    ConsentedBy = tostring(InitiatedBy.user.userPrincipalName),
+    ConsentType = tostring(TargetResources[0].modifiedProperties[0].newValue)
+| summarize 
+    TotalApprovals = count(),
+    UniqueUsers = dcount(ConsentedBy),
+    DangerousPermissions = countif(Permissions contains "Mail.ReadWrite" or Permissions contains "Mail.Send"),
+    AdminConsents = countif(ConsentType contains "Admin")
+    by bin(TimeGenerated, 1d)
+| project 
+    Date = TimeGenerated,
+    TotalApprovals,
+    UniqueUsers,
+    DangerousPermissions,
+    AdminConsents,
+    RiskScore = (DangerousPermissions * 2) + (AdminConsents * 5)
+| sort by Date desc
+
+// ============================================================================
+// SIEM Alert Configuration
+// ============================================================================
+// Recommended thresholds:
+//   Query 2 (Dangerous Perms): Severity: High, Frequency: 15 min
+//   Query 3 (Risky User OAuth): Severity: Critical, Frequency: 5 min
+//   Query 4 (Bulk Approvals): Severity: High, Frequency: 15 min
+//   Query 6 (Admin Consent): Severity: Critical, Frequency: 5 min
+//
+// Response Actions:
+//   1. Review app in Azure AD > Enterprise Applications
+//   2. Check app permissions and verify legitimacy
+//   3. If malicious: Revoke app permissions immediately
+//   4. Reset user password and revoke refresh tokens
+//   5. Review audit logs for data exfiltration
+// ============================================================================

@@ -1,0 +1,262 @@
+// ============================================================================
+// Detect Risky Users - Azure AD Identity Protection Integration
+// ============================================================================
+// Description: Queries Azure AD Identity Protection data to identify users
+//              flagged as risky by Microsoft's ML models. Correlates with
+//              recent activity to prioritize investigation.
+//
+// Data Source: SigninLogs, AuditLogs, AADRiskyUsers (Azure AD/Entra)
+// Author: Don Cook
+// Version: 1.0
+// Last Updated: October 24, 2025
+// ============================================================================
+
+// ============================================================================
+// Query 1: Current Risky Users with Sign-In Activity
+// ============================================================================
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where RiskLevelDuringSignIn in ("high", "medium")
+| summarize 
+    RiskySignIns = count(),
+    Countries = make_set(LocationDetails.countryOrRegion),
+    IPs = make_set(IPAddress),
+    SuccessfulSignIns = countif(ResultType == 0),
+    FailedSignIns = countif(ResultType != 0),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    RiskReasons = make_set(RiskDetail)
+    by UserPrincipalName, RiskLevelDuringSignIn
+| extend 
+    DaysSinceFirst = datetime_diff('day', now(), FirstSeen),
+    RiskScore = case(
+        RiskLevelDuringSignIn == "high", RiskySignIns * 5,
+        RiskLevelDuringSignIn == "medium", RiskySignIns * 2,
+        RiskySignIns
+    )
+| project 
+    UserPrincipalName,
+    RiskLevel = RiskLevelDuringSignIn,
+    RiskySignIns,
+    SuccessfulSignIns,
+    FailedSignIns,
+    Countries = tostring(Countries),
+    IPs = tostring(IPs),
+    RiskReasons = tostring(RiskReasons),
+    FirstSeen,
+    LastSeen,
+    RiskScore
+| sort by RiskScore desc
+
+// ============================================================================
+// Query 2: Risk State Transitions (Compromised → Remediated → At Risk Again)
+// ============================================================================
+// Tracks users whose risk state changes (possible repeat compromise)
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where isnotempty(RiskState)
+| summarize 
+    RiskStates = make_list(RiskState),
+    RiskChangeTimes = make_list(TimeGenerated),
+    CurrentRiskState = arg_max(TimeGenerated, RiskState)
+    by UserPrincipalName
+| extend UniqueStates = array_length(array_sort_asc(array_distinct(RiskStates)))
+| where UniqueStates >= 2 // Risk state changed at least once
+| project 
+    UserPrincipalName,
+    CurrentRiskState = CurrentRiskState_RiskState,
+    RiskStateHistory = tostring(RiskStates),
+    Alert = "⚠️ Risk state has changed multiple times"
+| sort by CurrentRiskState desc
+
+// ============================================================================
+// Query 3: Risky Users with Recent Mailbox Activity
+// ============================================================================
+// Cross-references risky users with mailbox/OAuth activity (requires Office 365 logs)
+let riskyUsers = SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where RiskLevelDuringSignIn in ("high", "medium")
+    | distinct UserPrincipalName;
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName in ("New-InboxRule", "Set-InboxRule", "Consent to application", "Add mailbox permission")
+| extend Actor = tostring(InitiatedBy.user.userPrincipalName)
+| where Actor in (riskyUsers)
+| summarize 
+    SuspiciousActions = count(),
+    Operations = make_set(OperationName),
+    FirstAction = min(TimeGenerated),
+    LastAction = max(TimeGenerated)
+    by Actor
+| project 
+    UserPrincipalName = Actor,
+    SuspiciousActions,
+    Operations = tostring(Operations),
+    FirstAction,
+    LastAction,
+    Alert = "🔴 CRITICAL: Risky user performed mailbox/OAuth actions"
+| sort by SuspiciousActions desc
+
+// ============================================================================
+// Query 4: Anonymous IP and Risky Sign-Ins
+// ============================================================================
+// Detects sign-ins from anonymous IPs (Tor, VPN, proxy) combined with risk
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where RiskLevelDuringSignIn != "none"
+| extend IsAnonymous = NetworkLocationDetails has "anonymousProxy" or NetworkLocationDetails has "tor"
+| where IsAnonymous == true
+| summarize 
+    AnonymousSignIns = count(),
+    Countries = make_set(LocationDetails.countryOrRegion),
+    RiskLevels = make_set(RiskLevelDuringSignIn),
+    RiskDetails = make_set(RiskDetail)
+    by UserPrincipalName, IPAddress
+| project 
+    UserPrincipalName,
+    IPAddress,
+    AnonymousSignIns,
+    Countries = tostring(Countries),
+    RiskLevels = tostring(RiskLevels),
+    RiskDetails = tostring(RiskDetails),
+    Alert = "🚨 Anonymous IP + Risky Sign-In"
+| sort by AnonymousSignIns desc
+
+// ============================================================================
+// Query 5: MFA Fatigue + Risky User
+// ============================================================================
+// Detects users who have risk detections AND MFA push notification fatigue
+SigninLogs
+| where TimeGenerated > ago(24h)
+| where RiskLevelDuringSignIn in ("high", "medium")
+| extend MFAResult = tostring(parse_json(AuthenticationDetails)[0].authenticationStepResultDetail)
+| where MFAResult contains "MFA denied" or MFAResult contains "timeout"
+| summarize 
+    MFADenials = count(),
+    RiskLevel = take_any(RiskLevelDuringSignIn),
+    Countries = make_set(LocationDetails.countryOrRegion),
+    IPs = make_set(IPAddress)
+    by UserPrincipalName
+| where MFADenials >= 3
+| project 
+    UserPrincipalName,
+    MFADenials,
+    RiskLevel,
+    Countries = tostring(Countries),
+    IPs = tostring(IPs),
+    Alert = "🔴 CRITICAL: Risky user + MFA fatigue attack"
+| sort by MFADenials desc
+
+// ============================================================================
+// Query 6: Confirmed Compromised Users Still Active
+// ============================================================================
+// Identifies users marked as "confirmedCompromised" who still have active sign-ins
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where RiskState == "confirmedCompromised"
+| where ResultType == 0 // Successful sign-ins
+| summarize 
+    SignInCount = count(),
+    RecentSignIns = make_list(TimeGenerated, 10),
+    Countries = make_set(LocationDetails.countryOrRegion),
+    IPs = make_set(IPAddress)
+    by UserPrincipalName
+| project 
+    UserPrincipalName,
+    SignInCount,
+    RecentSignIns = tostring(RecentSignIns),
+    Countries = tostring(Countries),
+    IPs = tostring(IPs),
+    Alert = "🚨 CRITICAL: Confirmed compromised user still signing in!"
+| sort by SignInCount desc
+
+// ============================================================================
+// Query 7: Risk Detection Timeline for User Investigation
+// ============================================================================
+// Creates detailed timeline of all risk events for specific user
+let targetUser = "user@domain.com"; // Replace with user being investigated
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where UserPrincipalName == targetUser
+| project 
+    TimeGenerated,
+    RiskLevel = RiskLevelDuringSignIn,
+    RiskState,
+    RiskDetail,
+    ResultType,
+    ResultDescription = ResultDescription,
+    IPAddress,
+    Country = LocationDetails.countryOrRegion,
+    City = LocationDetails.city,
+    Application = AppDisplayName,
+    UserAgent,
+    Success = iff(ResultType == 0, "✓ Success", "✗ Failed")
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Query 8: High-Risk Users with Privilege Changes
+// ============================================================================
+// Detects when risky users have their roles/permissions modified
+let riskyUsers = SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where RiskLevelDuringSignIn == "high"
+    | distinct UserPrincipalName;
+AuditLogs
+| where TimeGenerated > ago(7d)
+| where OperationName in ("Add member to role", "Add user", "Update user", "Add owner to group")
+| extend 
+    TargetUser = tostring(TargetResources[0].userPrincipalName),
+    Actor = tostring(InitiatedBy.user.userPrincipalName)
+| where TargetUser in (riskyUsers) or Actor in (riskyUsers)
+| project 
+    TimeGenerated,
+    OperationName,
+    Actor,
+    TargetUser,
+    Role = tostring(TargetResources[0].displayName),
+    Alert = "⚠️ Privilege change involving risky user"
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Consolidated Risk Dashboard - Executive Summary
+// ============================================================================
+SigninLogs
+| where TimeGenerated > ago(7d)
+| summarize 
+    TotalSignIns = count(),
+    RiskySignIns = countif(RiskLevelDuringSignIn != "none"),
+    HighRiskSignIns = countif(RiskLevelDuringSignIn == "high"),
+    MediumRiskSignIns = countif(RiskLevelDuringSignIn == "medium"),
+    ConfirmedCompromised = countif(RiskState == "confirmedCompromised"),
+    UniqueRiskyUsers = dcountif(UserPrincipalName, RiskLevelDuringSignIn != "none"),
+    UniqueCountries = dcount(LocationDetails.countryOrRegion)
+| extend 
+    RiskPercentage = round((RiskySignIns * 100.0) / TotalSignIns, 2),
+    CriticalUsers = ConfirmedCompromised
+| project 
+    Period = "Last 7 Days",
+    TotalSignIns,
+    RiskySignIns,
+    RiskPercentage,
+    HighRiskSignIns,
+    MediumRiskSignIns,
+    CriticalUsers = ConfirmedCompromised,
+    UniqueRiskyUsers,
+    HealthScore = 100 - (RiskPercentage * 2)
+
+// ============================================================================
+// SIEM Alert Configuration
+// ============================================================================
+// Recommended thresholds:
+//   Query 3 (Risky + Mailbox): Severity: Critical, Frequency: 5 min
+//   Query 5 (MFA Fatigue): Severity: Critical, Frequency: 5 min
+//   Query 6 (Confirmed Compromise): Severity: Critical, Frequency: Real-time
+//
+// Response Actions:
+//   1. Immediately disable user account if confirmedCompromised
+//   2. Reset password and revoke all refresh tokens
+//   3. Review recent mailbox activity (rules, delegates, OAuth)
+//   4. Check for data exfiltration in audit logs
+//   5. Force re-registration of MFA methods
+//   6. Notify user via alternate contact method
+// ============================================================================

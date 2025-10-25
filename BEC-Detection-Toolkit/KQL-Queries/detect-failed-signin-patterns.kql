@@ -1,0 +1,239 @@
+// ============================================================================
+// Detect Failed Sign-In Patterns - Brute Force & Password Spray
+// ============================================================================
+// Description: Identifies potential credential attacks including:
+//              - Brute force attacks (many failures from single IP)
+//              - Password spray attacks (failures across many users)
+//              - Credential stuffing attempts
+//
+// Data Source: SigninLogs (Azure AD/Entra)
+// Author: Don Cook
+// Version: 1.0
+// Last Updated: October 24, 2025
+// ============================================================================
+
+// ============================================================================
+// Query 1: Brute Force Detection - Single User, Many Failures
+// ============================================================================
+SigninLogs
+| where TimeGenerated > ago(1h)
+| where ResultType != 0 // Failed sign-ins
+| summarize 
+    FailedAttempts = count(),
+    UniqueIPs = dcount(IPAddress),
+    IPs = make_set(IPAddress),
+    Countries = make_set(LocationDetails.countryOrRegion),
+    FirstFailure = min(TimeGenerated),
+    LastFailure = max(TimeGenerated),
+    ErrorCodes = make_set(ResultType)
+    by UserPrincipalName
+| where FailedAttempts >= 10
+| extend TimeSpan = datetime_diff('minute', LastFailure, FirstFailure)
+| project 
+    UserPrincipalName,
+    FailedAttempts,
+    UniqueIPs,
+    TimeSpanMinutes = TimeSpan,
+    IPs = tostring(IPs),
+    Countries = tostring(Countries),
+    FirstFailure,
+    LastFailure,
+    AttackType = "Brute Force"
+| sort by FailedAttempts desc
+
+// ============================================================================
+// Query 2: Password Spray Detection - Single IP, Many Users
+// ============================================================================
+SigninLogs
+| where TimeGenerated > ago(1h)
+| where ResultType != 0
+| summarize 
+    TargetedUsers = dcount(UserPrincipalName),
+    FailedAttempts = count(),
+    Users = make_set(UserPrincipalName, 100),
+    FirstAttempt = min(TimeGenerated),
+    LastAttempt = max(TimeGenerated)
+    by IPAddress, LocationDetails.countryOrRegion
+| where TargetedUsers >= 5 // 5+ different users
+| extend TimeSpanMinutes = datetime_diff('minute', LastAttempt, FirstAttempt)
+| project 
+    IPAddress,
+    Country = LocationDetails_countryOrRegion,
+    TargetedUsers,
+    FailedAttempts,
+    TimeSpanMinutes,
+    FirstAttempt,
+    LastAttempt,
+    AttackType = "Password Spray"
+| sort by TargetedUsers desc
+
+// ============================================================================
+// Query 3: Failed Then Successful - Potential Compromise
+// ============================================================================
+// Critical: Detects when failed attempts are followed by success
+let failedLogins = SigninLogs
+    | where TimeGenerated > ago(24h)
+    | where ResultType != 0
+    | project FailTime = TimeGenerated, UserPrincipalName, FailIP = IPAddress;
+SigninLogs
+| where TimeGenerated > ago(24h)
+| where ResultType == 0 // Successful
+| project SuccessTime = TimeGenerated, UserPrincipalName, SuccessIP = IPAddress
+| join kind=inner (failedLogins) on UserPrincipalName
+| where SuccessTime > FailTime
+| extend MinutesBetween = datetime_diff('minute', SuccessTime, FailTime)
+| where MinutesBetween <= 60 // Success within 1 hour of failures
+| summarize 
+    FailedCount = count(),
+    SuccessAfterFailed = take_any(SuccessTime),
+    FailIPs = make_set(FailIP),
+    SuccessIP = take_any(SuccessIP)
+    by UserPrincipalName
+| project 
+    UserPrincipalName,
+    FailedCount,
+    SuccessAfterFailed,
+    FailIPs = tostring(FailIPs),
+    SuccessIP,
+    Alert = "Successful login after failures - Possible compromise"
+| sort by FailedCount desc
+
+// ============================================================================
+// Query 4: Failed Sign-Ins with Risky Error Codes
+// ============================================================================
+// Focuses on specific error codes indicating attacks
+SigninLogs
+| where TimeGenerated > ago(24h)
+| where ResultType in (
+    "50126", // Invalid username or password
+    "50053", // Locked out account (IDS detected)
+    "50057", // User account is disabled
+    "50055", // Password expired
+    "50076", // MFA required but not provided
+    "50074"  // Strong auth required
+)
+| summarize 
+    FailedCount = count(),
+    ErrorTypes = make_set(ResultType),
+    IPs = make_set(IPAddress),
+    Countries = make_set(LocationDetails.countryOrRegion)
+    by UserPrincipalName, ResultDescription
+| where FailedCount >= 5
+| project 
+    UserPrincipalName,
+    FailedCount,
+    ErrorTypes = tostring(ErrorTypes),
+    ErrorDescription = ResultDescription,
+    IPs = tostring(IPs),
+    Countries = tostring(Countries)
+| sort by FailedCount desc
+
+// ============================================================================
+// Query 5: Distributed Attack - Multiple IPs, Multiple Users
+// ============================================================================
+// Advanced: Detects coordinated attacks from botnets
+SigninLogs
+| where TimeGenerated > ago(1h)
+| where ResultType != 0
+| summarize 
+    TotalAttempts = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    UniqueIPs = dcount(IPAddress),
+    Countries = dcount(LocationDetails.countryOrRegion)
+    by bin(TimeGenerated, 5m)
+| where UniqueIPs >= 10 and UniqueUsers >= 10
+| project 
+    TimeWindow = TimeGenerated,
+    TotalAttempts,
+    UniqueUsers,
+    UniqueIPs,
+    UniqueCountries = Countries,
+    AttackType = "Distributed Credential Attack"
+| sort by TotalAttempts desc
+
+// ============================================================================
+// Query 6: High-Value Target Monitoring
+// ============================================================================
+// Monitors executives and admins for ANY failed sign-ins
+let vipUsers = dynamic([
+    "ceo@", "cfo@", "admin@", "sysadmin@", 
+    // Add your VIP/admin identifiers
+]);
+SigninLogs
+| where TimeGenerated > ago(24h)
+| where ResultType != 0
+| where UserPrincipalName has_any (vipUsers)
+| project 
+    TimeGenerated,
+    UserPrincipalName,
+    IPAddress,
+    Country = LocationDetails.countryOrRegion,
+    ErrorCode = ResultType,
+    ErrorDescription = ResultDescription,
+    Alert = "⚠️ VIP/Admin failed login"
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Query 7: Rate Limiting Detection
+// ============================================================================
+// Detects when rate limiting is being triggered (50053 errors)
+SigninLogs
+| where TimeGenerated > ago(1h)
+| where ResultType == "50053" // Account locked
+| summarize 
+    LockoutCount = count(),
+    FirstLockout = min(TimeGenerated),
+    LastLockout = max(TimeGenerated),
+    IPs = make_set(IPAddress)
+    by UserPrincipalName
+| extend TimeSpan = datetime_diff('minute', LastLockout, FirstLockout)
+| project 
+    UserPrincipalName,
+    LockoutCount,
+    TimeSpanMinutes = TimeSpan,
+    IPs = tostring(IPs),
+    Alert = "🔒 Account locked due to failed attempts"
+| sort by LockoutCount desc
+
+// ============================================================================
+// Consolidated Dashboard Query - All Attack Types
+// ============================================================================
+SigninLogs
+| where TimeGenerated > ago(1h)
+| where ResultType != 0
+| summarize 
+    TotalFailures = count(),
+    UniqueUsers = dcount(UserPrincipalName),
+    UniqueIPs = dcount(IPAddress),
+    UniqueCountries = dcount(LocationDetails.countryOrRegion),
+    MostTargetedUser = arg_max(UserPrincipalName, count()),
+    MostActiveIP = arg_max(IPAddress, count())
+| extend 
+    AttackType = case(
+        UniqueUsers > 10 and UniqueIPs > 10, "Distributed Attack",
+        UniqueUsers > 5 and UniqueIPs < 3, "Password Spray",
+        UniqueUsers < 3 and TotalFailures > 20, "Brute Force",
+        "Unknown Pattern"
+    )
+| project 
+    TotalFailures,
+    UniqueUsers,
+    UniqueIPs,
+    UniqueCountries,
+    AttackType,
+    MostTargetedUser,
+    MostActiveIP
+
+// ============================================================================
+// SIEM Alert Configuration
+// ============================================================================
+// Recommended thresholds:
+//   Query 1 (Brute Force): FailedAttempts >= 10, Severity: High
+//   Query 2 (Password Spray): TargetedUsers >= 5, Severity: Critical
+//   Query 3 (Failed then Success): count() > 0, Severity: Critical
+//   Query 6 (VIP Failed): count() > 0, Severity: High
+//
+// Alert Frequency: Every 5 minutes for Queries 1,2,6
+//                  Every 15 minutes for Query 3
+// Suppression: 1 hour per user/IP
+// ============================================================================

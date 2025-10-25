@@ -1,0 +1,174 @@
+// ============================================================================
+// Detect Impossible Travel - Advanced BEC Indicator
+// ============================================================================
+// Description: Detects when a user authenticates from two different geographic
+//              locations within a physically impossible timeframe.
+//              Classic indicator of credential compromise.
+//
+// Data Source: SigninLogs (Azure AD/Entra)
+// Author: Don Cook
+// Version: 1.0
+// Last Updated: October 24, 2025
+// ============================================================================
+
+// ============================================================================
+// Method 1: Self-Join Approach (Most Accurate)
+// ============================================================================
+// Joins sign-in events with themselves to find location changes
+let timeWindow = 2h; // Impossible to travel between countries in 2 hours
+let minDistance = 500; // km - adjust based on your needs
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == 0 // Successful sign-ins only
+| where isnotempty(LocationDetails.countryOrRegion)
+| project 
+    TimeGenerated,
+    UserPrincipalName,
+    IPAddress,
+    Country = LocationDetails.countryOrRegion,
+    State = LocationDetails.state,
+    City = LocationDetails.city,
+    Latitude = LocationDetails.geoCoordinates.latitude,
+    Longitude = LocationDetails.geoCoordinates.longitude
+| join kind=inner (
+    SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where ResultType == 0
+    | where isnotempty(LocationDetails.countryOrRegion)
+    | project 
+        TimeGenerated2 = TimeGenerated,
+        UserPrincipalName,
+        IPAddress2 = IPAddress,
+        Country2 = LocationDetails.countryOrRegion,
+        State2 = LocationDetails.state,
+        City2 = LocationDetails.city,
+        Latitude2 = LocationDetails.geoCoordinates.latitude,
+        Longitude2 = LocationDetails.geoCoordinates.longitude
+) on UserPrincipalName
+| where TimeGenerated < TimeGenerated2
+| where Country != Country2
+| extend TimeDiffMinutes = datetime_diff('minute', TimeGenerated2, TimeGenerated)
+| where TimeDiffMinutes > 0 and TimeDiffMinutes <= 120
+| project 
+    UserPrincipalName,
+    FirstLocation = strcat(City, ", ", Country),
+    SecondLocation = strcat(City2, ", ", Country2),
+    FirstTime = TimeGenerated,
+    SecondTime = TimeGenerated2,
+    TimeDiffMinutes,
+    FirstIP = IPAddress,
+    SecondIP = IPAddress2
+| sort by TimeDiffMinutes asc
+
+// ============================================================================
+// Method 2: Simplified Country Change Detection
+// ============================================================================
+// Faster query that just looks for different countries in short timeframe
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where isnotempty(LocationDetails.countryOrRegion)
+| summarize 
+    SignInTimes = make_list(TimeGenerated, 100),
+    Countries = make_set(LocationDetails.countryOrRegion, 100),
+    Cities = make_set(LocationDetails.city, 100),
+    IPs = make_set(IPAddress, 100)
+    by UserPrincipalName
+| extend CountryCount = array_length(Countries)
+| where CountryCount > 1
+| mvexpand SignInTimes
+| project 
+    UserPrincipalName,
+    UniqueCountries = CountryCount,
+    Countries = tostring(Countries),
+    Cities = tostring(Cities),
+    IPs = tostring(IPs)
+| distinct *
+
+// ============================================================================
+// Method 3: Time-Series Analysis (Most Performant)
+// ============================================================================
+// Uses bins to group events and detect rapid location changes
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where isnotempty(LocationDetails.countryOrRegion)
+| summarize 
+    Countries = make_set(LocationDetails.countryOrRegion),
+    IPs = make_set(IPAddress),
+    Cities = make_set(LocationDetails.city)
+    by UserPrincipalName, bin(TimeGenerated, 1h)
+| extend CountryCount = array_length(Countries)
+| where CountryCount > 1
+| project 
+    TimeGenerated,
+    UserPrincipalName,
+    Countries = tostring(Countries),
+    IPs = tostring(IPs),
+    Alert = "Multiple countries in 1 hour"
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Advanced: High-Risk Travel Patterns
+// ============================================================================
+// Identifies specific risky country combinations
+let riskyCountries = dynamic(["Russia", "China", "Nigeria", "Iran", "North Korea"]);
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where ResultType == 0
+| where isnotempty(LocationDetails.countryOrRegion)
+| extend Country = tostring(LocationDetails.countryOrRegion)
+| summarize 
+    Countries = make_set(Country),
+    SignInCount = count()
+    by UserPrincipalName
+| mv-expand Country = Countries
+| where Country in (riskyCountries)
+| summarize 
+    RiskyCountries = make_set(Country),
+    TotalCountries = make_set(Countries)[0]
+    by UserPrincipalName
+| project 
+    UserPrincipalName,
+    RiskyCountries = tostring(RiskyCountries),
+    AllCountries = tostring(TotalCountries),
+    RiskScore = array_length(RiskyCountries) * 10
+
+// ============================================================================
+// Method 4: Compare with Historical Baseline
+// ============================================================================
+// Detects travel to NEW countries that user hasn't visited before
+let historicalPeriod = 90d;
+let recentPeriod = 7d;
+let historicalCountries = SigninLogs
+    | where TimeGenerated between (ago(historicalPeriod) .. ago(recentPeriod))
+    | where ResultType == 0
+    | summarize HistoricalCountries = make_set(LocationDetails.countryOrRegion) 
+      by UserPrincipalName;
+SigninLogs
+| where TimeGenerated > ago(recentPeriod)
+| where ResultType == 0
+| summarize RecentCountries = make_set(LocationDetails.countryOrRegion) 
+    by UserPrincipalName
+| join kind=leftouter (historicalCountries) on UserPrincipalName
+| mv-expand RecentCountry = RecentCountries
+| where RecentCountry !in (HistoricalCountries)
+| project 
+    UserPrincipalName,
+    NewCountry = tostring(RecentCountry),
+    Alert = "First time visiting this country"
+
+// ============================================================================
+// SIEM Alert Configuration
+// ============================================================================
+// Recommended thresholds:
+//   - Severity: High
+//   - Frequency: Every 15 minutes
+//   - Alert when: TimeDiffMinutes < 120 and Country != Country2
+//   - Suppress for: 4 hours per user
+//
+// False Positive Notes:
+//   - VPN usage can trigger false positives
+//   - Mobile roaming between countries (rare but possible)
+//   - Shared accounts (service accounts should be excluded)
+// ============================================================================

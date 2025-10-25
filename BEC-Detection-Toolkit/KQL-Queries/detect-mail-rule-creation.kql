@@ -1,0 +1,111 @@
+// ============================================================================
+// Detect Malicious Mail Rule Creation
+// ============================================================================
+// Description: Detects when inbox rules are created or modified that could
+//              indicate a Business Email Compromise (BEC) attack.
+//              Look for rules that delete, forward, or hide emails.
+//
+// Data Source: AuditLogs (Azure AD/Entra)
+// Author: Don Cook
+// Version: 1.0
+// Last Updated: October 24, 2025
+// ============================================================================
+
+// CRITICAL: This requires Office 365 audit logs to be ingested into your 
+// Log Analytics workspace. If you don't have OfficeActivity table, you need
+// to configure the Office 365 connector in Azure Sentinel.
+
+// For environments WITH OfficeActivity table:
+OfficeActivity
+| where TimeGenerated > ago(30d)
+| where Operation in ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules")
+| extend RuleName = tostring(parse_json(Parameters)[0].Value)
+| extend RuleActions = tostring(parse_json(Parameters)[1].Value)
+| project 
+    TimeGenerated,
+    UserId,
+    Operation,
+    RuleName,
+    RuleActions,
+    ClientIP,
+    UserAgent,
+    ResultStatus
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Alternative: For environments WITHOUT OfficeActivity
+// ============================================================================
+// Use PowerShell to query and export to custom table:
+// Search-UnifiedAuditLog -Operations "UpdateInboxRules","New-InboxRule" 
+//     -StartDate (Get-Date).AddDays(-30) -EndDate (Get-Date) -ResultSize 5000
+
+// ============================================================================
+// Detection Logic - Look for Suspicious Rule Patterns
+// ============================================================================
+OfficeActivity
+| where TimeGenerated > ago(7d)
+| where Operation in ("New-InboxRule", "Set-InboxRule")
+| extend Parameters = todynamic(Parameters)
+| extend 
+    RuleName = tostring(Parameters[0].Value),
+    DeleteMessage = tobool(Parameters[1].Value),
+    MoveToFolder = tostring(Parameters[2].Value),
+    ForwardTo = tostring(Parameters[3].Value),
+    MarkAsRead = tobool(Parameters[4].Value)
+| where 
+    DeleteMessage == true or
+    MoveToFolder contains "Deleted Items" or 
+    MoveToFolder contains "RSS" or
+    MoveToFolder contains "Junk" or
+    isnotempty(ForwardTo) or
+    MarkAsRead == true
+| project 
+    TimeGenerated,
+    UserId,
+    RuleName,
+    DeleteMessage,
+    MoveToFolder,
+    ForwardTo,
+    MarkAsRead,
+    ClientIP
+| sort by TimeGenerated desc
+
+// ============================================================================
+// Advanced: Detect Rules Targeting Internal Domain
+// ============================================================================
+// This identifies rules that specifically target emails from internal senders
+OfficeActivity
+| where TimeGenerated > ago(7d)
+| where Operation in ("New-InboxRule", "Set-InboxRule")
+| extend Parameters = todynamic(Parameters)
+| extend FromCondition = tostring(Parameters[5].Value)
+| where FromCondition contains "@" // Contains domain check
+| where 
+    DeleteMessage == true or
+    MoveToFolder contains "Deleted" or
+    MoveToFolder contains "RSS"
+| project TimeGenerated, UserId, RuleName, FromCondition, ClientIP
+
+// ============================================================================
+// Hunting Query: Bulk Rule Creation
+// ============================================================================
+// Detects when multiple rules are created in short time (automation/script)
+OfficeActivity
+| where TimeGenerated > ago(24h)
+| where Operation in ("New-InboxRule", "Set-InboxRule")
+| summarize 
+    RuleCount = count(),
+    Rules = make_set(tostring(Parameters[0].Value))
+    by UserId, bin(TimeGenerated, 5m)
+| where RuleCount >= 3
+| sort by RuleCount desc
+
+// ============================================================================
+// SIEM Alert Rule Configuration
+// ============================================================================
+// Recommended alert threshold: 
+//   - Severity: High
+//   - Frequency: Every 5 minutes
+//   - Alert when: count() > 0
+//   - Suppress for: 1 hour per user
+// ============================================================================
