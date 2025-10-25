@@ -10,11 +10,7 @@
 
 
 
-Enterprise-grade Business Email Compromise (BEC) detection and response 
-
-toolkit for Microsoft 365 environments. Built for organizations that can't 
-
-afford expensive SIEM/SOAR solutions like Darktrace, Splunk, or CrowdStrike.
+Enterprise-grade Business Email Compromise (BEC) detection and response  toolkit for Microsoft 365 environments. Built for organizations that can't  afford expensive SIEM/SOAR solutions like Darktrace, Splunk, or CrowdStrike.
 
 
 
