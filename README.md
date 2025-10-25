@@ -132,11 +132,11 @@ Builds chronological view of compromise:
 
 ## 📖 Documentation
 
-* [Installation Guide](Documentation/Installation.md)
-* [Usage Examples](Documentation/Usage-Examples.md)
-* [Detection Logic](Documentation/Detection-Logic.md)
-* [Remediation Guide](Documentation/Remediation-Guide.md)
-* [KQL Query Reference](KQL-Queries/)
+* [Installation Guide](BEC-Detection-Toolkit/Documentation/Installation.md)
+* [Usage Examples](BEC-Detection-Toolkit/Documentation/Usage-Examples.md)
+* [Detection Logic](BEC-Detection-Toolkit/Documentation/Detection-Logic.md)
+* [Remediation Guide](BEC-Detection-Toolkit/Documentation/Remediation-Guide.md)
+* [KQL Query Reference](BEC-Detection-Toolkit/KQL-Queries/)
 
 ---
 
