@@ -233,7 +233,7 @@ The author is not responsible for misuse or damage caused by these tools.
 
 **Author:** Don Cook
 **TryHackMe:** [Top 1% - scrizo](https://tryhackme.com/p/scrizo)
-**LinkedIn:** [[Your Profile](https://www.linkedin.com/in/doncook79/)]
+**LinkedIn:** [[LinkedIn](https://www.linkedin.com/in/doncook79/)]
 **Issues:** [GitHub Issues](https://github.com/[you]/BEC-Detection-Toolkit/issues)
 
 ---
